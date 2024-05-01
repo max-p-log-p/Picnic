@@ -30,10 +30,11 @@
 #include "picnic_types.h"
 #include "hash.h"
 
+#include <sys/random.h>
+
 #define MAX(a, b) ((a) > (b)) ? (a) : (b)
 
 #define VIEW_OUTPUTS(i, j) viewOutputs[(i) * 3 + (j)]
-
 
 /* Helper functions */
 
@@ -349,6 +350,17 @@ uint8_t getChallenge(const uint8_t* challenge, size_t round)
     uint32_t roundU32 = (uint32_t)round;
 
     return (getBit(challenge, 2 * roundU32 + 1) << 1) | getBit(challenge, 2 * roundU32);
+}
+
+void H2(const uint8_t* message, size_t messageByteLength, uint8_t* output, size_t outputBytes, paramset_t* params)
+{
+    HashInstance ctx;
+
+    /* Hash the message with H_6, store digest in output */
+    HashInit(&ctx, params, HASH_PREFIX_6);
+    HashUpdate(&ctx, message, messageByteLength);
+    HashFinal(&ctx);
+    HashSqueeze(&ctx, output, outputBytes);
 }
 
 void H3(const uint32_t* circuitOutput, const uint32_t* plaintext, uint32_t** viewOutputs,
@@ -865,6 +877,116 @@ seeds_t* computeSeeds(uint32_t* privateKey, uint32_t*
     return allSeeds;
 }
 
+int commit(uint32_t* pubKey, uint32_t* plaintext, const uint8_t* message,
+                 size_t messageByteLength, signature_t* sig, paramset_t* params)
+{
+    bool status;
+
+    /* Allocate views and commitments for all parallel iterations */
+    view_t** views = allocateViews(params);
+    commitments_t* as = allocateCommitments(params, 0);
+    g_commitments_t* gs = allocateGCommitments(params);
+
+    /* Compute seeds for all parallel iterations */
+    // seeds_t* seeds = computeSeeds(privateKey, pubKey, plaintext, message, messageByteLength, params);
+    seeds_t* seeds = allocateSeeds(params);
+
+	if (getrandom(seeds[0].seed[0], params->seedSizeBytes * (params->numMPCParties * params->numMPCRounds), 0) == -1)
+		return EXIT_FAILURE;
+
+    memcpy(sig->salt, seeds[params->numMPCRounds].iSeed, params->saltSizeBytes);
+
+    // Generate challenges
+    H2(message, messageByteLength, sig->challengeBits, numBytes(2 * params->numMPCRounds), params);
+
+    //Allocate a random tape (re-used per parallel iteration), and a temporary buffer
+    randomTape_t tape;
+
+    allocateRandomTape(&tape, params);
+    uint8_t* tmp = malloc( MAX(9 * params->stateSizeBytes, params->stateSizeBytes + params->andSizeBytes));
+
+    for (uint32_t k = 0; k < params->numMPCRounds; k++) {
+        // for first two players get all tape INCLUDING INPUT SHARE from seed
+        for (int j = 0; j < 2; j++) {
+            status = createRandomTape(seeds[k].seed[j], sig->salt, k, j, tmp, params->stateSizeBytes + params->andSizeBytes, params);
+            if (!status) {
+                PRINT_DEBUG(("createRandomTape failed \n"));
+                return EXIT_FAILURE;
+            }
+            memcpy(views[k][j].inputShare, tmp, params->stateSizeBytes);
+            zeroTrailingBits((uint8_t*)views[k][j].inputShare, params->stateSizeBits);
+            memcpy(tape.tape[j], tmp + params->stateSizeBytes, params->andSizeBytes);
+        }
+
+        // Now set third party's wires. The random bits are from the seed, the input is
+        // the XOR of other two inputs and the private key
+        status = createRandomTape(seeds[k].seed[2], sig->salt, k, 2, tape.tape[2], params->andSizeBytes, params);
+        if (!status) {
+            PRINT_DEBUG(("createRandomTape failed \n"));
+            return EXIT_FAILURE;
+        }
+
+
+        // xor_three(views[k][2].inputShare, privateKey, views[k][0].inputShare, views[k][1].inputShare, params->stateSizeBytes);
+        tape.pos = 0;
+        mpc_LowMC(&tape, views[k], plaintext, (uint32_t*)tmp, params);
+
+        // uint32_t temp[LOWMC_MAX_WORDS] = {0};
+		uint8_t e = getChallenge(sig->challengeBits, k);
+		uint8_t e1 = (e + 1) % 3;
+		uint8_t e2 = (e + 2) % 3;
+
+        xor_three(views[k][e2].outputShare, views[k][e].outputShare, views[k][e1].outputShare, pubKey, params->stateSizeBytes);
+        // if(memcmp(temp, pubKey, params->stateSizeBytes) != 0) {
+        //     PRINT_DEBUG(("Simulation failed; output does not match public key (round = %u)\n", k));
+        //     return EXIT_FAILURE;
+        // }
+
+        //Committing
+        Commit(seeds[k].seed[0], views[k][0], as[k].hashes[0], params);
+        Commit(seeds[k].seed[1], views[k][1], as[k].hashes[1], params);
+        Commit(seeds[k].seed[2], views[k][2], as[k].hashes[2], params);
+
+        if (params->transform == TRANSFORM_UR) {
+            G(0, seeds[k].seed[0], &views[k][0], gs[k].G[0], params);
+            G(1, seeds[k].seed[1], &views[k][1], gs[k].G[1], params);
+            G(2, seeds[k].seed[2], &views[k][2], gs[k].G[2], params);
+        }
+    }
+
+    //Packing Z
+    for (size_t i = 0; i < params->numMPCRounds; i++) {
+        proof_t* proof = &sig->proofs[i];
+        prove(proof, getChallenge(sig->challengeBits, i), &seeds[i],
+              views[i], &as[i], (gs == NULL) ? NULL : &gs[i], params);
+    }
+
+
+#if 0   /* Self-test, verify the signature we just created */
+    printf("\n-----------\n");
+    int ret = verify(sig, pubKey, plaintext, message, messageByteLength, params);
+    if(ret != EXIT_SUCCESS) {
+        printf("Self-test of signature verification failed\n");
+        exit(-1);
+    }
+    else {
+        printf("Self-test succeeded\n");
+    }
+    printf("\n-----------\n");
+#endif
+
+
+    free(tmp);
+
+    freeViews(views, params);
+    freeCommitments(as);
+    freeRandomTape(&tape);
+    freeGCommitments(gs);
+    // free(viewOutputs);
+    freeSeeds(seeds);
+
+    return EXIT_SUCCESS;
+}
 
 int sign_picnic1(uint32_t* privateKey, uint32_t* pubKey, uint32_t* plaintext, const uint8_t* message,
                  size_t messageByteLength, signature_t* sig, paramset_t* params)
