@@ -33,6 +33,9 @@ static const uint8_t HASH_PREFIX_3 = 3;
 static const uint8_t HASH_PREFIX_4 = 4;
 static const uint8_t HASH_PREFIX_5 = 5;
 static const uint8_t HASH_PREFIX_6 = 6;
+static const uint8_t HASH_PREFIX_7 = 7;
+static const uint8_t HASH_PREFIX_8 = 8;
+static const uint8_t HASH_PREFIX_9 = 9;
 
 typedef Keccak_HashInstance HashInstance;
 

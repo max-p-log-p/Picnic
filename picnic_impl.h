@@ -17,6 +17,8 @@
 #include <stdint.h>
 #include <stddef.h>
 
+#include <sys/random.h>
+
 //#define DEBUG
 
 /* Macro that wraps printf and only produces output when DEBUG is defined */

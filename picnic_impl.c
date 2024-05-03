@@ -30,8 +30,6 @@
 #include "picnic_types.h"
 #include "hash.h"
 
-#include <sys/random.h>
-
 #define MAX(a, b) ((a) > (b)) ? (a) : (b)
 
 #define VIEW_OUTPUTS(i, j) viewOutputs[(i) * 3 + (j)]
@@ -352,15 +350,45 @@ uint8_t getChallenge(const uint8_t* challenge, size_t round)
     return (getBit(challenge, 2 * roundU32 + 1) << 1) | getBit(challenge, 2 * roundU32);
 }
 
-void H2(const uint8_t* message, size_t messageByteLength, uint8_t* output, size_t outputBytes, paramset_t* params)
+void H2(const uint8_t* message, size_t messageByteLength, uint8_t* challenge, paramset_t* params)
 {
     HashInstance ctx;
+	uint8_t *output;
+	uint8_t bits;
+
+	output = malloc(params->digestSizeBytes);
 
     /* Hash the message with H_6, store digest in output */
     HashInit(&ctx, params, HASH_PREFIX_6);
     HashUpdate(&ctx, message, messageByteLength);
     HashFinal(&ctx);
-    HashSqueeze(&ctx, output, outputBytes);
+    HashSqueeze(&ctx, output, params->digestSizeBytes);
+
+	size_t round = 0;
+
+	while(1) {
+		for (uint32_t i = 0; i < params->digestSizeBytes; ++i) {
+			for (int b = 6; b >= 0; b -= 2) {
+				bits = (output[i] >> b) & 3;
+
+				if (bits >= 3)
+					continue;
+
+				setChallenge(challenge, round, bits);
+
+				if (++round == params->numMPCRounds)
+					goto done;
+			}
+		}
+
+		HashInit(&ctx, params, HASH_PREFIX_6);
+		HashUpdate(&ctx, output, params->digestSizeBytes);
+		HashFinal(&ctx);
+		HashSqueeze(&ctx, output, params->digestSizeBytes);
+	}
+
+done:
+	free(output);
 }
 
 void H3(const uint32_t* circuitOutput, const uint32_t* plaintext, uint32_t** viewOutputs,
@@ -627,6 +655,91 @@ void verifyProof(const proof_t* proof, view_t* view1, view_t* view2,
     mpc_LowMC_verify(view1, view2, tape, (uint32_t*)tmp, plaintext, params, challenge);
 }
 
+int verify2(signature_t* sig, const uint32_t* pubKey, const uint32_t* plaintext,
+           const uint8_t* message, size_t messageByteLength, paramset_t* params)
+{
+    commitments_t* as = allocateCommitments(params, 0);
+    g_commitments_t* gs = allocateGCommitments(params);
+
+    uint32_t** viewOutputs = malloc(params->numMPCRounds * 3 * sizeof(uint32_t*));
+    const proof_t* proofs = sig->proofs;
+
+    const uint8_t* received_challengebits = sig->challengeBits;
+    int status = EXIT_SUCCESS;
+    uint8_t* computed_challengebits = NULL;
+    uint32_t* view3Slab = NULL;
+
+    uint8_t* tmp = malloc(MAX(6 * params->stateSizeBytes, params->stateSizeBytes + params->andSizeBytes));
+
+    randomTape_t* tape = (randomTape_t*)malloc(sizeof(randomTape_t));
+
+    allocateRandomTape(tape, params);
+
+    view_t* view1s = malloc(params->numMPCRounds * sizeof(view_t));
+    view_t* view2s = malloc(params->numMPCRounds * sizeof(view_t));
+
+    /* Allocate a slab of memory for the 3rd view's output in each round */
+    view3Slab = calloc(params->stateSizeBytes, params->numMPCRounds);
+    uint32_t* view3Output = view3Slab;     /* pointer into the slab to the current 3rd view */
+
+    for (size_t i = 0; i < params->numMPCRounds; i++) {
+        allocateView(&view1s[i], params);
+        allocateView(&view2s[i], params);
+
+        verifyProof(&proofs[i], &view1s[i], &view2s[i],
+                    getChallenge(received_challengebits, i), sig->salt, i,
+                    tmp, plaintext, tape, params);
+
+        // create ordered array of commitments with order computed based on the challenge
+        // check commitments of the two opened views
+        uint8_t challenge = getChallenge(received_challengebits, i);
+        Commit(proofs[i].seed1, view1s[i], as[i].hashes[challenge], params);
+        Commit(proofs[i].seed2, view2s[i], as[i].hashes[(challenge + 1) % 3], params);
+        memcpy(as[i].hashes[(challenge + 2) % 3], proofs[i].view3Commitment, params->digestSizeBytes);
+
+        if (params->transform == TRANSFORM_UR) {
+            G(challenge, proofs[i].seed1, &view1s[i], gs[i].G[challenge], params);
+            G((challenge + 1) % 3, proofs[i].seed2, &view2s[i], gs[i].G[(challenge + 1) % 3], params);
+            size_t view3UnruhLength = (challenge == 0) ? params->UnruhGWithInputBytes : params->UnruhGWithoutInputBytes;
+            memcpy(gs[i].G[(challenge + 2) % 3], proofs[i].view3UnruhG, view3UnruhLength);
+        }
+
+        VIEW_OUTPUTS(i, challenge) = view1s[i].outputShare;
+        VIEW_OUTPUTS(i, (challenge + 1) % 3) = view2s[i].outputShare;
+        xor_three(view3Output, view1s[i].outputShare,  view2s[i].outputShare, pubKey, params->stateSizeBytes);
+        VIEW_OUTPUTS(i, (challenge + 2) % 3) = view3Output;
+        view3Output = (uint32_t*) ((uint8_t*)view3Output + params->stateSizeBytes);
+    }
+
+    computed_challengebits = malloc(numBytes(2 * params->numMPCRounds));
+
+    H2(message, messageByteLength, computed_challengebits, params);
+
+    if (computed_challengebits != NULL &&
+        memcmp(received_challengebits, computed_challengebits, numBytes(2 * params->numMPCRounds)) != 0) {
+        PRINT_DEBUG(("Invalid signature. Did not verify\n"));
+        status = EXIT_FAILURE;
+    }
+
+    free(computed_challengebits);
+    free(view3Slab);
+
+    freeCommitments(as);
+    for (size_t i = 0; i < params->numMPCRounds; i++) {
+        freeView(&view1s[i]);
+        freeView(&view2s[i]);
+    }
+    free(view1s);
+    free(view2s);
+    free(tmp);
+    freeRandomTape(tape);
+    free(tape);
+    freeGCommitments(gs);
+    free(viewOutputs);
+
+    return status;
+}
+
 int verify(signature_t* sig, const uint32_t* pubKey, const uint32_t* plaintext,
            const uint8_t* message, size_t messageByteLength, paramset_t* params)
 {
@@ -877,8 +990,8 @@ seeds_t* computeSeeds(uint32_t* privateKey, uint32_t*
     return allSeeds;
 }
 
-int commit(uint32_t* pubKey, uint32_t* plaintext, const uint8_t* message,
-                 size_t messageByteLength, signature_t* sig, paramset_t* params)
+int commit(picnic_publickey_t* pubKey, const uint8_t* message, size_t messageByteLength,
+		signature_t* sig, paramset_t* params)
 {
     bool status;
 
@@ -888,8 +1001,8 @@ int commit(uint32_t* pubKey, uint32_t* plaintext, const uint8_t* message,
     g_commitments_t* gs = allocateGCommitments(params);
 
     /* Compute seeds for all parallel iterations */
-    // seeds_t* seeds = computeSeeds(privateKey, pubKey, plaintext, message, messageByteLength, params);
     seeds_t* seeds = allocateSeeds(params);
+    // seeds_t* seeds = computeSeeds(privateKey, pubKey, plaintext, message, messageByteLength, params);
 
 	if (getrandom(seeds[0].seed[0], params->seedSizeBytes * (params->numMPCParties * params->numMPCRounds), 0) == -1)
 		return EXIT_FAILURE;
@@ -897,7 +1010,7 @@ int commit(uint32_t* pubKey, uint32_t* plaintext, const uint8_t* message,
     memcpy(sig->salt, seeds[params->numMPCRounds].iSeed, params->saltSizeBytes);
 
     // Generate challenges
-    H2(message, messageByteLength, sig->challengeBits, numBytes(2 * params->numMPCRounds), params);
+    H2(message, messageByteLength, sig->challengeBits, params);
 
     //Allocate a random tape (re-used per parallel iteration), and a temporary buffer
     randomTape_t tape;
@@ -929,14 +1042,14 @@ int commit(uint32_t* pubKey, uint32_t* plaintext, const uint8_t* message,
 
         // xor_three(views[k][2].inputShare, privateKey, views[k][0].inputShare, views[k][1].inputShare, params->stateSizeBytes);
         tape.pos = 0;
-        mpc_LowMC(&tape, views[k], plaintext, (uint32_t*)tmp, params);
+        mpc_LowMC(&tape, views[k], (uint32_t *)pubKey->plaintext, (uint32_t*)tmp, params);
 
         // uint32_t temp[LOWMC_MAX_WORDS] = {0};
 		uint8_t e = getChallenge(sig->challengeBits, k);
 		uint8_t e1 = (e + 1) % 3;
 		uint8_t e2 = (e + 2) % 3;
 
-        xor_three(views[k][e2].outputShare, views[k][e].outputShare, views[k][e1].outputShare, pubKey, params->stateSizeBytes);
+        xor_three(views[k][e2].outputShare, views[k][e].outputShare, views[k][e1].outputShare, (uint32_t *)pubKey->ciphertext, params->stateSizeBytes);
         // if(memcmp(temp, pubKey, params->stateSizeBytes) != 0) {
         //     PRINT_DEBUG(("Simulation failed; output does not match public key (round = %u)\n", k));
         //     return EXIT_FAILURE;
@@ -964,7 +1077,7 @@ int commit(uint32_t* pubKey, uint32_t* plaintext, const uint8_t* message,
 
 #if 0   /* Self-test, verify the signature we just created */
     printf("\n-----------\n");
-    int ret = verify(sig, pubKey, plaintext, message, messageByteLength, params);
+    int ret = verify(sig, pubKey, pubKey->plaintext, message, messageByteLength, params);
     if(ret != EXIT_SUCCESS) {
         printf("Self-test of signature verification failed\n");
         exit(-1);
@@ -988,8 +1101,7 @@ int commit(uint32_t* pubKey, uint32_t* plaintext, const uint8_t* message,
     return EXIT_SUCCESS;
 }
 
-int trapdoor_commit(uint32_t* privateKey, uint32_t* pubKey, uint32_t* plaintext, seeds_t* seeds,
-	view_t** views, commitments_t* as, g_commitments_t* gs, signature_t* sig, paramset_t* params)
+int trapdoor_commit(uint32_t* privateKey, picnic_publickey_t* pubKey, view_t** views, seeds_t* seeds, commitments_t* as, g_commitments_t* gs, signature_t *sig, paramset_t* params)
 {
     bool status;
 
@@ -999,9 +1111,9 @@ int trapdoor_commit(uint32_t* privateKey, uint32_t* pubKey, uint32_t* plaintext,
     // g_commitments_t* gs = allocateGCommitments(params);
 
     /* Compute seeds for all parallel iterations */
-    seeds = allocateSeeds(params);
+    // seeds_t* seeds = computeSeeds(privateKey, pubKey, plaintext, message, messageByteLength, params);
 
-	if (getrandom(seeds[0].seed[0], params->seedSizeBytes * (params->numMPCParties * params->numMPCRounds), 0) == -1)
+	if (getrandom(seeds[0].seed[0], params->seedSizeBytes * (params->numMPCParties * params->numMPCRounds) + params->saltSizeBytes, 0) == -1)
 		return EXIT_FAILURE;
 
     memcpy(sig->salt, seeds[params->numMPCRounds].iSeed, params->saltSizeBytes);
@@ -1036,11 +1148,11 @@ int trapdoor_commit(uint32_t* privateKey, uint32_t* pubKey, uint32_t* plaintext,
 
         xor_three(views[k][2].inputShare, privateKey, views[k][0].inputShare, views[k][1].inputShare, params->stateSizeBytes);
         tape.pos = 0;
-        mpc_LowMC(&tape, views[k], plaintext, (uint32_t*)tmp, params);
+        mpc_LowMC(&tape, views[k], (uint32_t *)pubKey->plaintext, (uint32_t*)tmp, params);
 
         uint32_t temp[LOWMC_MAX_WORDS] = {0};
         xor_three(temp, views[k][0].outputShare, views[k][1].outputShare, views[k][2].outputShare, params->stateSizeBytes);
-        if(memcmp(temp, pubKey, params->stateSizeBytes) != 0) {
+        if(memcmp(temp, pubKey->ciphertext, params->stateSizeBytes) != 0) {
             PRINT_DEBUG(("Simulation failed; output does not match public key (round = %u)\n", k));
             return EXIT_FAILURE;
         }
@@ -1064,10 +1176,10 @@ int trapdoor_commit(uint32_t* privateKey, uint32_t* pubKey, uint32_t* plaintext,
 }
 
 int trapdoor_open(const uint8_t* message, size_t messageByteLength, view_t** views, seeds_t* seeds,
-		commitments_t* as, g_commitments_t* gs,signature_t* sig, paramset_t* params)
+		commitments_t* as, g_commitments_t* gs, signature_t* sig, paramset_t* params)
 {
     // Generate challenges
-    H2(message, messageByteLength, sig->challengeBits, numBytes(2 * params->numMPCRounds), params);
+    H2(message, messageByteLength, sig->challengeBits, params);
 
     //Packing Z
     for (size_t i = 0; i < params->numMPCRounds; i++) {
@@ -1076,25 +1188,10 @@ int trapdoor_open(const uint8_t* message, size_t messageByteLength, view_t** vie
               views[i], &as[i], (gs == NULL) ? NULL : &gs[i], params);
     }
 
-
-#if 0   /* Self-test, verify the signature we just created */
-    printf("\n-----------\n");
-    int ret = verify(sig, pubKey, plaintext, message, messageByteLength, params);
-    if(ret != EXIT_SUCCESS) {
-        printf("Self-test of signature verification failed\n");
-        exit(-1);
-    }
-    else {
-        printf("Self-test succeeded\n");
-    }
-    printf("\n-----------\n");
-#endif
-
-
-    freeViews(views, params);
-    freeCommitments(as);
-    freeGCommitments(gs);
-    freeSeeds(seeds);
+    // freeViews(views, params);
+    // freeCommitments(as);
+    // freeGCommitments(gs);
+    // freeSeeds(seeds);
 
     return EXIT_SUCCESS;
 }
