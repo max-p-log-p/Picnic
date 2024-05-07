@@ -991,14 +991,14 @@ seeds_t* computeSeeds(uint32_t* privateKey, uint32_t*
 }
 
 int commit(picnic_publickey_t* pubKey, const uint8_t* message, size_t messageByteLength,
-		signature_t* sig, paramset_t* params)
+		commitments_t* as, g_commitments_t* gs, signature_t* sig, paramset_t* params)
 {
     bool status;
 
     /* Allocate views and commitments for all parallel iterations */
     view_t** views = allocateViews(params);
-    commitments_t* as = allocateCommitments(params, 0);
-    g_commitments_t* gs = allocateGCommitments(params);
+    // commitments_t* as = allocateCommitments(params, 0);
+    // g_commitments_t* gs = allocateGCommitments(params);
 
     /* Compute seeds for all parallel iterations */
     seeds_t* seeds = allocateSeeds(params);
@@ -1092,9 +1092,9 @@ int commit(picnic_publickey_t* pubKey, const uint8_t* message, size_t messageByt
     free(tmp);
 
     freeViews(views, params);
-    freeCommitments(as);
+    // freeCommitments(as);
     freeRandomTape(&tape);
-    freeGCommitments(gs);
+    // freeGCommitments(gs);
     // free(viewOutputs);
     freeSeeds(seeds);
 

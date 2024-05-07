@@ -36,8 +36,8 @@ int get_param_set(picnic_params_t, paramset_t *);
 
 typedef uint64_t field_t;
 
-int commit(picnic_publickey_t *, const uint8_t *, size_t,
-		signature_t *, paramset_t *);
+int commit(picnic_publickey_t *, const uint8_t *, size_t, commitments_t *,
+		g_commitments_t *, signature_t *, paramset_t *);
 int trapdoor_commit(uint32_t *, picnic_publickey_t *, view_t **, seeds_t *,
 		commitments_t *, g_commitments_t *, uint8_t *, paramset_t *);
 int trapdoor_open(const uint8_t *, size_t, view_t **, seeds_t *,
