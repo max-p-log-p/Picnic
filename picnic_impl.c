@@ -1101,7 +1101,7 @@ int commit(picnic_publickey_t* pubKey, const uint8_t* message, size_t messageByt
     return EXIT_SUCCESS;
 }
 
-int trapdoor_commit(uint32_t* privateKey, picnic_publickey_t* pubKey, view_t** views, seeds_t* seeds, commitments_t* as, g_commitments_t* gs, signature_t *sig, paramset_t* params)
+int trapdoor_commit(uint32_t* privateKey, picnic_publickey_t* pubKey, view_t** views, seeds_t* seeds, commitments_t* as, g_commitments_t* gs, uint8_t *salt, paramset_t* params)
 {
     bool status;
 
@@ -1116,7 +1116,7 @@ int trapdoor_commit(uint32_t* privateKey, picnic_publickey_t* pubKey, view_t** v
 	if (getrandom(seeds[0].seed[0], params->seedSizeBytes * (params->numMPCParties * params->numMPCRounds) + params->saltSizeBytes, 0) == -1)
 		return EXIT_FAILURE;
 
-    memcpy(sig->salt, seeds[params->numMPCRounds].iSeed, params->saltSizeBytes);
+    memcpy(salt, seeds[params->numMPCRounds].iSeed, params->saltSizeBytes);
 
     //Allocate a random tape (re-used per parallel iteration), and a temporary buffer
     randomTape_t tape;
@@ -1127,7 +1127,7 @@ int trapdoor_commit(uint32_t* privateKey, picnic_publickey_t* pubKey, view_t** v
     for (uint32_t k = 0; k < params->numMPCRounds; k++) {
         // for first two players get all tape INCLUDING INPUT SHARE from seed
         for (int j = 0; j < 2; j++) {
-            status = createRandomTape(seeds[k].seed[j], sig->salt, k, j, tmp, params->stateSizeBytes + params->andSizeBytes, params);
+            status = createRandomTape(seeds[k].seed[j], salt, k, j, tmp, params->stateSizeBytes + params->andSizeBytes, params);
             if (!status) {
                 PRINT_DEBUG(("createRandomTape failed \n"));
                 return EXIT_FAILURE;
@@ -1139,7 +1139,7 @@ int trapdoor_commit(uint32_t* privateKey, picnic_publickey_t* pubKey, view_t** v
 
         // Now set third party's wires. The random bits are from the seed, the input is
         // the XOR of other two inputs and the private key
-        status = createRandomTape(seeds[k].seed[2], sig->salt, k, 2, tape.tape[2], params->andSizeBytes, params);
+        status = createRandomTape(seeds[k].seed[2], salt, k, 2, tape.tape[2], params->andSizeBytes, params);
         if (!status) {
             PRINT_DEBUG(("createRandomTape failed \n"));
             return EXIT_FAILURE;
